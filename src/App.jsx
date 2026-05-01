@@ -75,6 +75,7 @@ export default function App() {
   const [comments,   setComments]   = useState({});
   const [missions,   setMissions]   = useState({});
   const [rooms,      setRooms]      = useState([]);
+  const [isAdmin,    setIsAdmin]    = useState(false);
 
   const uid = myProfile?.id;
 
@@ -99,9 +100,9 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // ── Firestore 실시간 리스너 (로그인 후) ──────────────
+  // ── Firestore 실시간 리스너 (로그인 후 또는 관리자) ──
   useEffect(() => {
-    if (authStatus !== "auth") return;
+    if (authStatus !== "auth" && !isAdmin) return;
     const unsubs = [
       onSnapshot(query(col("profiles")), s => setProfiles(s.docs.map(d => ({ id: d.id, ...d.data() })))),
       onSnapshot(query(col("meetings")), s => setMeetings(s.docs.map(d => ({ id: d.id, ...d.data() })))),
@@ -115,7 +116,7 @@ export default function App() {
       }),
     ];
     return () => unsubs.forEach(u => u());
-  }, [authStatus]);
+  }, [authStatus, isAdmin]);
 
   // ── 사진 업로드 헬퍼 ─────────────────────────────────
   const uploadPhoto = async (base64, path) => {
@@ -370,8 +371,8 @@ export default function App() {
 
       {/* 오버레이 */}
       {overlay?.type === "profile"     && <ProfileForm initialData={myProfile} onSave={saveProfile} onBack={() => setOverlay(null)} onLogout={handleLogout} />}
-      {overlay?.type === "adminAuth"   && <AdminAuth onSuccess={() => setOverlay({ type: "admin" })} onBack={() => setOverlay(null)} />}
-      {overlay?.type === "admin"       && <AdminView profiles={profiles} posts={posts} missions={missions} onBack={() => setOverlay(null)} onUpdateProfile={adminUpdateProfile} onDeleteAccount={adminDeleteAccount} />}
+      {overlay?.type === "adminAuth"   && <AdminAuth onSuccess={() => { setIsAdmin(true); setOverlay({ type: "admin" }); }} onBack={() => setOverlay(null)} />}
+      {overlay?.type === "admin"       && <AdminView profiles={profiles} posts={posts} missions={missions} onBack={() => { setIsAdmin(false); setOverlay(null); }} onUpdateProfile={adminUpdateProfile} onDeleteAccount={adminDeleteAccount} />}
       {overlay?.type === "chat"        && <ChatRoom roomId={overlay.data.roomId} name={overlay.data.name} myProfile={myProfile} uid={uid} profiles={profiles} chats={chats} setChats={setChats} onSend={addMsg} onBack={() => setOverlay(null)} db={db} />}
       {overlay?.type === "post"        && <PostDetail post={overlay.data} profiles={profiles} uid={uid} myProfile={myProfile} onAddComment={t => addComment(overlay.data.id, t)} onLike={() => likePost(overlay.data.id)} onBack={() => setOverlay(null)} db={db} />}
       {overlay?.type === "newPost"     && <NewPost onSubmit={async p => { await addPost(p); setOverlay(null); }} onBack={() => setOverlay(null)} />}
