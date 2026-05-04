@@ -6,8 +6,8 @@ import {
   signOut,
 } from "firebase/auth";
 import {
-  collection, doc, setDoc, getDoc, onSnapshot, query,
-  addDoc, updateDoc, deleteDoc, orderBy, serverTimestamp,
+  collection, doc, setDoc, getDoc, getDocs, onSnapshot, query,
+  addDoc, updateDoc, deleteDoc, orderBy, serverTimestamp, where,
 } from "firebase/firestore";
 import {
   ref as storageRef, uploadString, getDownloadURL,
@@ -148,23 +148,41 @@ export default function App() {
       const email = `${username}@globalconnect.hmg`;
       let id = null;
 
-      // 삭제된 계정인지 확인
-      const deletedSnap = await getDoc(docR("deletedAccounts", username));
-      if (deletedSnap.exists()) {
-        // 삭제된 계정 → 로그인 시도 후 프로필만 새로 생성
-        try {
-          const cred = await signInWithEmailAndPassword(auth, email, password);
-          id = cred.user.uid;
-        } catch(loginErr) {
-          // 비밀번호가 다르면 새 계정 생성 불가 → 관리자에게 문의 안내
-          return "이 아이디는 관리자에 의해 삭제된 계정입니다. 다른 아이디로 가입해주세요.";
-        }
-        // deletedAccounts에서 제거
-        try { await deleteDoc(docR("deletedAccounts", username)); } catch(e) {}
-      } else {
-        // 일반 신규 가입
+      // 먼저 신규 가입 시도
+      try {
         const cred = await createUserWithEmailAndPassword(auth, email, password);
         id = cred.user.uid;
+        // deletedAccounts에 있으면 제거
+        try { await deleteDoc(docR("deletedAccounts", username)); } catch(e) {}
+      } catch(createErr) {
+        if (createErr.code === "auth/email-already-in-use") {
+          // 이미 Auth 계정 존재 → 삭제된 계정인지 확인
+          const deletedSnap = await getDoc(docR("deletedAccounts", username));
+          if (deletedSnap.exists()) {
+            // 삭제된 계정 → 새 비밀번호로 로그인 시도 (기존 비번 동일한 경우)
+            try {
+              const cred = await signInWithEmailAndPassword(auth, email, password);
+              id = cred.user.uid;
+              // 로그인 성공 → deletedAccounts 제거
+              try { await deleteDoc(docR("deletedAccounts", username)); } catch(e) {}
+            } catch(loginErr) {
+              // 비밀번호 다름 → profiles만 새로 만들고 oldId 재사용
+              const deletedData = deletedSnap.data();
+              if (deletedData?.oldId) {
+                // oldId로 프로필 재생성 (Auth 없이 Firestore만)
+                id = deletedData.oldId;
+                try { await deleteDoc(docR("deletedAccounts", username)); } catch(e) {}
+              } else {
+                return "이 아이디는 이미 사용 중입니다. 다른 아이디를 사용해주세요.";
+              }
+            }
+          } else {
+            // 삭제되지 않은 일반 중복 → 오류
+            return "이미 사용 중인 아이디입니다.";
+          }
+        } else {
+          throw createErr;
+        }
       }
 
       let photoUrl = "";
@@ -318,16 +336,21 @@ export default function App() {
   };
 
   // ── 관리자: 프로필 수정 ──────────────────────────────
-  // profiles 직접 수정은 권한 오류 → adminOverrides 컬렉션 사용
   const adminUpdateProfile = async (id, changes) => {
+    // adminOverrides에는 매칭용 필드만 저장 (updatedAt 등 불필요 필드 제외)
+    const matchFields = {};
+    if (changes.city    !== undefined) matchFields.city    = changes.city;
+    if (changes.country !== undefined) matchFields.country = changes.country;
+    if (changes.concern !== undefined) matchFields.concern = changes.concern;
     try {
-      // adminOverrides 컬렉션: 누구나 쓸 수 있도록 Firestore rules에 추가 필요
-      await setDoc(docR("adminOverrides", id), { ...changes, updatedAt: new Date().toISOString() }, { merge: true });
+      await setDoc(docR("adminOverrides", id), matchFields, { merge: true });
     } catch(e) {
       console.warn("adminOverrides write err:", e.message);
     }
-    // 로컬 상태 즉시 반영
-    setProfiles(prev => prev.map(p => p.id === id ? { ...p, ...changes } : p));
+    // 로컬 profiles 상태 즉시 반영
+    setProfiles(prev => prev.map(p => p.id === id ? { ...p, ...matchFields } : p));
+    // adminOverrides 로컬 상태도 즉시 반영
+    setAdminOverrides(prev => ({ ...prev, [id]: { ...(prev[id] || {}), ...matchFields } }));
   };
 
   // ── 관리자: 계정 삭제 ────────────────────────────────
@@ -335,13 +358,15 @@ export default function App() {
   // → deletedAccounts 컬렉션에 username 기록 → 재가입 시 Auth 계정 덮어쓰기 허용
   const adminDeleteAccount = async (targetId) => {
     const targetProfile = profiles.find(p => p.id === targetId);
-    // deletedAccounts에 username 기록 (재가입 허용용)
+    // deletedAccounts에 username + oldId 기록 (재가입 허용용)
     if (targetProfile?.username) {
       try {
         await setDoc(docR("deletedAccounts", targetProfile.username), {
-          deletedAt: new Date().toISOString(), oldId: targetId
+          deletedAt: new Date().toISOString(),
+          oldId: targetId,
+          username: targetProfile.username,
         });
-      } catch(e) {}
+      } catch(e) { console.warn("deletedAccounts 기록 실패:", e.message); }
     }
     // profile 삭제
     try { await deleteDoc(docR("profiles", targetId)); } catch(e) { console.warn(e.message); }
@@ -376,7 +401,7 @@ export default function App() {
 
   const renderMain = () => {
     switch (view) {
-      case "dashboard":  return <Dashboard profiles={mergedProfiles} myProfile={myProfile} uid={uid} onRequest={sendReq} onChat={p => openChat(roomFor(p.id), p.name)} />;
+      case "dashboard":  return <Dashboard profiles={mergedProfiles} myProfile={mergedProfiles.find(p => p.id === uid) || myProfile} uid={uid} onRequest={sendReq} onChat={p => openChat(roomFor(p.id), p.name)} />;
       case "directory":  return <Directory profiles={mergedProfiles} uid={uid} onRequest={sendReq} onChat={p => openChat(roomFor(p.id), p.name)} onViewProfile={p => setOverlay({ type: "profileView", data: p })} />;
       case "community":  return <Community posts={posts} profiles={mergedProfiles} rooms={rooms} uid={uid} onOpenPost={p => setOverlay({ type: "post", data: p })} onNewPost={() => setOverlay({ type: "newPost" })} onOpenChat={(id, name) => openChat(id, name)} onCreateRoom={createRoom} onLeaveRoom={leaveRoom} onInviteToRoom={inviteToRoom} />;
       case "meetings":   return <Meetings meetings={meetings} profiles={mergedProfiles} uid={uid} onUpdate={updateMtg} onChat={m => { const oid = m.fromId === uid ? m.toId : m.fromId; openChat(roomFor(oid), m.fromId === uid ? m.toName : m.fromName); }} />;
@@ -476,21 +501,23 @@ function AuthView({ onLogin, onRegister, onAdmin }) {
     if (uname.trim().length < 4) return setErrMsg("아이디는 4자 이상이어야 합니다.");
     if (pw.length < 4)  return setErrMsg("비밀번호는 4자 이상이어야 합니다.");
     if (pw !== pw2)     return setErrMsg("비밀번호가 일치하지 않습니다.");
-    // 아이디 중복 확인 (1단계에서 미리)
     setLoading(true);
     try {
-      const { fetchSignInMethodsForEmail } = await import("firebase/auth");
-      const email = `${uname.trim()}@globalconnect.hmg`;
-      const methods = await fetchSignInMethodsForEmail(auth, email);
-      // deletedAccounts인지 확인
-      const { getDoc, doc } = await import("firebase/firestore");
-      const deletedSnap = await getDoc(doc(db, "deletedAccounts", uname.trim()));
-      if (methods.length > 0 && !deletedSnap.exists()) {
+      // Firebase Auth에 이미 가입된 이메일인지 확인
+      // createUserWithEmailAndPassword 시도 → 오류 코드로 판단
+      // 단, 실제 계정 생성은 하지 않고 profiles 컬렉션에서 username 중복 확인
+      const snap = await getDoc(docR("deletedAccounts", uname.trim()));
+      const isDeleted = snap.exists();
+      // profiles에서 같은 username 있는지 확인
+      const profileSnap = await getDocs(
+        query(col("profiles"), where("username", "==", uname.trim()))
+      );
+      if (!profileSnap.empty && !isDeleted) {
         setLoading(false);
         return setErrMsg("이미 사용 중인 아이디입니다.");
       }
     } catch(e) {
-      // 확인 실패 시 그냥 진행 (2단계에서 최종 확인)
+      console.warn("중복확인 오류:", e.message);
     }
     setLoading(false);
     setStep(2);
