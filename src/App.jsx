@@ -100,6 +100,9 @@ export default function App() {
     return () => unsub();
   }, []);
 
+  // ── adminOverrides 상태 ───────────────────────────────
+  const [adminOverrides, setAdminOverrides] = useState({});
+
   // ── Firestore 실시간 리스너 (로그인 후 또는 관리자) ──
   useEffect(() => {
     if (authStatus !== "auth" && !isAdmin) return;
@@ -114,9 +117,22 @@ export default function App() {
         s.docs.forEach(d => { obj[d.id] = d.data(); });
         setMissions(obj);
       }),
+      // 관리자 오버라이드 실시간 반영
+      onSnapshot(query(col("adminOverrides")), s => {
+        const obj = {};
+        s.docs.forEach(d => { obj[d.id] = d.data(); });
+        setAdminOverrides(obj);
+      }),
     ];
     return () => unsubs.forEach(u => u());
   }, [authStatus, isAdmin]);
+
+  // profiles에 adminOverrides 합성 (매칭에 반영)
+  const mergedProfiles = profiles.map(p => {
+    const ov = adminOverrides[p.id];
+    if (!ov) return p;
+    return { ...p, ...ov };
+  });
 
   // ── 사진 업로드 헬퍼 ─────────────────────────────────
   const uploadPhoto = async (base64, path) => {
@@ -130,8 +146,27 @@ export default function App() {
   const handleRegister = async (username, password, profileData) => {
     try {
       const email = `${username}@globalconnect.hmg`;
-      const cred  = await createUserWithEmailAndPassword(auth, email, password);
-      const id    = cred.user.uid;
+      let id = null;
+
+      // 삭제된 계정인지 확인
+      const deletedSnap = await getDoc(docR("deletedAccounts", username));
+      if (deletedSnap.exists()) {
+        // 삭제된 계정 → 로그인 시도 후 프로필만 새로 생성
+        try {
+          const cred = await signInWithEmailAndPassword(auth, email, password);
+          id = cred.user.uid;
+        } catch(loginErr) {
+          // 비밀번호가 다르면 새 계정 생성 불가 → 관리자에게 문의 안내
+          return "이 아이디는 관리자에 의해 삭제된 계정입니다. 다른 아이디로 가입해주세요.";
+        }
+        // deletedAccounts에서 제거
+        try { await deleteDoc(docR("deletedAccounts", username)); } catch(e) {}
+      } else {
+        // 일반 신규 가입
+        const cred = await createUserWithEmailAndPassword(auth, email, password);
+        id = cred.user.uid;
+      }
+
       let photoUrl = "";
       if (profileData.photoUrl) {
         photoUrl = await uploadPhoto(profileData.photoUrl, `avatars/${id}`);
@@ -261,6 +296,27 @@ export default function App() {
     await addDoc(col("rooms"), { ...roomData, creatorId: uid, createdAt: new Date().toISOString() });
   };
 
+  // ── 채팅방 나가기 ─────────────────────────────────────
+  const leaveRoom = async (roomId) => {
+    const room = rooms.find(r => r.id === roomId);
+    if (!room) return;
+    const newMembers = (room.members || []).filter(m => m !== uid);
+    if (newMembers.length === 0) {
+      // 멤버가 없으면 방 삭제
+      try { await deleteDoc(docR("rooms", roomId)); } catch(e) {}
+    } else {
+      await updateDoc(docR("rooms", roomId), { members: newMembers });
+    }
+  };
+
+  // ── 채팅방 초대 ──────────────────────────────────────
+  const inviteToRoom = async (roomId, inviteeIds) => {
+    const room = rooms.find(r => r.id === roomId);
+    if (!room) return;
+    const newMembers = [...new Set([...(room.members || []), ...inviteeIds])];
+    await updateDoc(docR("rooms", roomId), { members: newMembers });
+  };
+
   // ── 관리자: 프로필 수정 ──────────────────────────────
   // profiles 직접 수정은 권한 오류 → adminOverrides 컬렉션 사용
   const adminUpdateProfile = async (id, changes) => {
@@ -275,20 +331,30 @@ export default function App() {
   };
 
   // ── 관리자: 계정 삭제 ────────────────────────────────
+  // Firebase Auth는 Admin SDK 없이 클라이언트에서 삭제 불가
+  // → deletedAccounts 컬렉션에 username 기록 → 재가입 시 Auth 계정 덮어쓰기 허용
   const adminDeleteAccount = async (targetId) => {
-    try {
-      await deleteDoc(docR("profiles", targetId));
-    } catch(e) {
-      console.warn("profile delete err:", e.message);
+    const targetProfile = profiles.find(p => p.id === targetId);
+    // deletedAccounts에 username 기록 (재가입 허용용)
+    if (targetProfile?.username) {
+      try {
+        await setDoc(docR("deletedAccounts", targetProfile.username), {
+          deletedAt: new Date().toISOString(), oldId: targetId
+        });
+      } catch(e) {}
     }
-    // 관련 meetings 삭제 (에러 무시)
+    // profile 삭제
+    try { await deleteDoc(docR("profiles", targetId)); } catch(e) { console.warn(e.message); }
+    // adminOverrides 삭제
+    try { await deleteDoc(docR("adminOverrides", targetId)); } catch(e) {}
+    // 관련 meetings 삭제
     const relatedMtgs = meetings.filter(m => m.fromId === targetId || m.toId === targetId);
     for (const m of relatedMtgs) {
       try { await deleteDoc(docR("meetings", m.id)); } catch(e) {}
     }
-    // 미션 삭제 시도
+    // 미션 삭제
     try { await deleteDoc(docR("missions", targetId)); } catch(e) {}
-    // 로컬 상태 즉시 반영 (Firestore 권한 오류여도 UI에서는 제거)
+    // 로컬 상태 즉시 반영
     setProfiles(prev => prev.filter(p => p.id !== targetId));
     setMeetings(prev => prev.filter(m => m.fromId !== targetId && m.toId !== targetId));
   };
@@ -310,10 +376,10 @@ export default function App() {
 
   const renderMain = () => {
     switch (view) {
-      case "dashboard":  return <Dashboard profiles={profiles} myProfile={myProfile} uid={uid} onRequest={sendReq} onChat={p => openChat(roomFor(p.id), p.name)} />;
-      case "directory":  return <Directory profiles={profiles} uid={uid} onRequest={sendReq} onChat={p => openChat(roomFor(p.id), p.name)} onViewProfile={p => setOverlay({ type: "profileView", data: p })} />;
-      case "community":  return <Community posts={posts} profiles={profiles} rooms={rooms} uid={uid} onOpenPost={p => setOverlay({ type: "post", data: p })} onNewPost={() => setOverlay({ type: "newPost" })} onOpenChat={(id, name) => openChat(id, name)} onCreateRoom={createRoom} />;
-      case "meetings":   return <Meetings meetings={meetings} profiles={profiles} uid={uid} onUpdate={updateMtg} onChat={m => { const oid = m.fromId === uid ? m.toId : m.fromId; openChat(roomFor(oid), m.fromId === uid ? m.toName : m.fromName); }} />;
+      case "dashboard":  return <Dashboard profiles={mergedProfiles} myProfile={myProfile} uid={uid} onRequest={sendReq} onChat={p => openChat(roomFor(p.id), p.name)} />;
+      case "directory":  return <Directory profiles={mergedProfiles} uid={uid} onRequest={sendReq} onChat={p => openChat(roomFor(p.id), p.name)} onViewProfile={p => setOverlay({ type: "profileView", data: p })} />;
+      case "community":  return <Community posts={posts} profiles={mergedProfiles} rooms={rooms} uid={uid} onOpenPost={p => setOverlay({ type: "post", data: p })} onNewPost={() => setOverlay({ type: "newPost" })} onOpenChat={(id, name) => openChat(id, name)} onCreateRoom={createRoom} onLeaveRoom={leaveRoom} onInviteToRoom={inviteToRoom} />;
+      case "meetings":   return <Meetings meetings={meetings} profiles={mergedProfiles} uid={uid} onUpdate={updateMtg} onChat={m => { const oid = m.fromId === uid ? m.toId : m.fromId; openChat(roomFor(oid), m.fromId === uid ? m.toName : m.fromName); }} />;
       case "missions":   return <MissionView myMissions={myMissions} sentCount={sentCount} uid={uid} onUpdate={updateMission} />;
       case "calendar":   return <CalView meetings={meetings} events={events} uid={uid} onAdd={addEvent} />;
       default: return null;
@@ -372,9 +438,9 @@ export default function App() {
       {/* 오버레이 */}
       {overlay?.type === "profile"     && <ProfileForm initialData={myProfile} onSave={saveProfile} onBack={() => setOverlay(null)} onLogout={handleLogout} />}
       {overlay?.type === "adminAuth"   && <AdminAuth onSuccess={() => { setIsAdmin(true); setOverlay({ type: "admin" }); }} onBack={() => setOverlay(null)} />}
-      {overlay?.type === "admin"       && <AdminView profiles={profiles} posts={posts} missions={missions} onBack={() => { setIsAdmin(false); setOverlay(null); }} onUpdateProfile={adminUpdateProfile} onDeleteAccount={adminDeleteAccount} />}
-      {overlay?.type === "chat"        && <ChatRoom roomId={overlay.data.roomId} name={overlay.data.name} myProfile={myProfile} uid={uid} profiles={profiles} chats={chats} setChats={setChats} onSend={addMsg} onBack={() => setOverlay(null)} db={db} />}
-      {overlay?.type === "post"        && <PostDetail post={overlay.data} profiles={profiles} uid={uid} myProfile={myProfile} onAddComment={t => addComment(overlay.data.id, t)} onLike={() => likePost(overlay.data.id)} onBack={() => setOverlay(null)} db={db} />}
+      {overlay?.type === "admin"       && <AdminView profiles={mergedProfiles} posts={posts} missions={missions} meetings={meetings} onBack={() => { setIsAdmin(false); setOverlay(null); }} onUpdateProfile={adminUpdateProfile} onDeleteAccount={adminDeleteAccount} />}
+      {overlay?.type === "chat"        && <ChatRoom roomId={overlay.data.roomId} name={overlay.data.name} myProfile={myProfile} uid={uid} profiles={mergedProfiles} chats={chats} setChats={setChats} onSend={addMsg} onBack={() => setOverlay(null)} db={db} rooms={rooms} onLeaveRoom={leaveRoom} onInviteToRoom={inviteToRoom} />}
+      {overlay?.type === "post"        && <PostDetail post={overlay.data} profiles={mergedProfiles} uid={uid} myProfile={myProfile} onAddComment={t => addComment(overlay.data.id, t)} onLike={() => likePost(overlay.data.id)} onBack={() => setOverlay(null)} db={db} />}
       {overlay?.type === "newPost"     && <NewPost onSubmit={async p => { await addPost(p); setOverlay(null); }} onBack={() => setOverlay(null)} />}
       {overlay?.type === "profileView" && <ProfileView profile={overlay.data} onBack={() => setOverlay(null)} onRequest={() => { sendReq(overlay.data); setOverlay(null); }} onChat={() => { openChat(roomFor(overlay.data.id), overlay.data.name); setOverlay(null); }} />}
     </div>
@@ -404,11 +470,29 @@ function AuthView({ onLogin, onRegister, onAdmin }) {
     setLoading(false);
   };
 
-  const doNext = () => {
+  const doNext = async () => {
     setErrMsg("");
     if (!uname.trim()) return setErrMsg("아이디를 입력해주세요.");
+    if (uname.trim().length < 4) return setErrMsg("아이디는 4자 이상이어야 합니다.");
     if (pw.length < 4)  return setErrMsg("비밀번호는 4자 이상이어야 합니다.");
     if (pw !== pw2)     return setErrMsg("비밀번호가 일치하지 않습니다.");
+    // 아이디 중복 확인 (1단계에서 미리)
+    setLoading(true);
+    try {
+      const { fetchSignInMethodsForEmail } = await import("firebase/auth");
+      const email = `${uname.trim()}@globalconnect.hmg`;
+      const methods = await fetchSignInMethodsForEmail(auth, email);
+      // deletedAccounts인지 확인
+      const { getDoc, doc } = await import("firebase/firestore");
+      const deletedSnap = await getDoc(doc(db, "deletedAccounts", uname.trim()));
+      if (methods.length > 0 && !deletedSnap.exists()) {
+        setLoading(false);
+        return setErrMsg("이미 사용 중인 아이디입니다.");
+      }
+    } catch(e) {
+      // 확인 실패 시 그냥 진행 (2단계에서 최종 확인)
+    }
+    setLoading(false);
     setStep(2);
   };
 
@@ -625,7 +709,7 @@ function AdminAuth({ onSuccess, onBack }) {
   );
 }
 
-function AdminView({ profiles, posts, missions, onBack, onUpdateProfile, onDeleteAccount }) {
+function AdminView({ profiles, posts, missions, meetings, onBack, onUpdateProfile, onDeleteAccount }) {
   const [tab, setTab]       = useState("users");
   const [editId, setEditId] = useState(null);
   const [editForm, setEF]   = useState({});
@@ -702,7 +786,9 @@ function AdminView({ profiles, posts, missions, onBack, onUpdateProfile, onDelet
             <p style={{ fontSize: 12, color: "#64748b", marginBottom: 4 }}>전체 미션 현황</p>
             {profiles.map(p => {
               const ms     = missions[p.id] || {};
-              const m1done = (ms.m1Count || 0) >= 2;
+              // 티미팅 발송: missions의 m1Count 대신 실제 meetings에서 계산
+              const sentCnt = (meetings || []).filter(m => m.fromId === p.id).length;
+              const m1done = sentCnt >= 2;
               const m2done = (ms.m2Photos || []).length >= 2;
               const m3done = (ms.m3Photos || []).length >= 1;
               const allDone = m1done && m2done && m3done;
@@ -714,7 +800,7 @@ function AdminView({ profiles, posts, missions, onBack, onUpdateProfile, onDelet
                     {allDone && <span style={{ background: "rgba(34,197,94,0.12)", color: "#4ade80", fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 8 }}>완료</span>}
                   </div>
                   <div style={{ display: "flex", gap: 6 }}>
-                    {[["티미팅 발송", m1done],["티미팅 인증", m2done],["식사 인증", m3done]].map(([label, done]) => (
+                    {[["티미팅 발송 "+sentCnt+"/2", m1done],["티미팅 인증 "+(ms.m2Photos||[]).length+"/2", m2done],["식사 인증 "+(ms.m3Photos||[]).length+"/1", m3done]].map(([label, done]) => (
                       <div key={label} style={{ flex: 1, background: done ? "rgba(34,197,94,0.08)" : "rgba(255,255,255,0.04)", border: `1px solid ${done ? "rgba(34,197,94,0.2)" : "rgba(255,255,255,0.07)"}`, borderRadius: 10, padding: "6px 4px", textAlign: "center" }}>
                         <p style={{ fontSize: 9, color: done ? "#4ade80" : "#64748b", fontWeight: 700, margin: 0 }}>{done ? "✓ " : ""}{label}</p>
                       </div>
@@ -860,10 +946,15 @@ function ProfileView({ profile, onBack, onRequest, onChat }) {
   );
 }
 
-function ChatRoom({ roomId, name, myProfile, uid, profiles, chats, setChats, onSend, onBack, db }) {
-  const [msgs,  setMsgs]  = useState([]);
-  const [input, setInput] = useState("");
+function ChatRoom({ roomId, name, myProfile, uid, profiles, chats, setChats, onSend, onBack, db, rooms, onLeaveRoom, onInviteToRoom }) {
+  const [msgs,      setMsgs]      = useState([]);
+  const [input,     setInput]     = useState("");
+  const [showPanel, setShowPanel] = useState(null); // null | "members" | "invite"
+  const [invitees,  setInvitees]  = useState([]);
   const isGroup = roomId.startsWith("city_") || roomId === "global" || roomId.startsWith("room");
+  const currentRoom = rooms?.find(r => r.id === roomId);
+  const memberProfiles = (currentRoom?.members || []).map(mid => profiles.find(p => p.id === mid)).filter(Boolean);
+  const nonMembers = profiles.filter(p => p.id !== uid && !(currentRoom?.members || []).includes(p.id));
 
   useEffect(() => {
     const q = query(collection(db, "chats", roomId, "messages"), orderBy("createdAt"));
@@ -877,8 +968,56 @@ function ChatRoom({ roomId, name, myProfile, uid, profiles, chats, setChats, onS
       <div style={S.overlayHeader}>
         <button onClick={onBack} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 20, padding: 4 }}>←</button>
         <div style={{ width: 36, height: 36, background: "rgba(245,158,11,0.1)", borderRadius: 12, border: "1px solid rgba(245,158,11,0.2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>{isGroup ? "👥" : "💬"}</div>
-        <div><p style={{ fontSize: 14, fontWeight: 700, color: "#fff", margin: 0 }}>{name}</p><p style={{ fontSize: 10, color: "#64748b", margin: 0 }}>{isGroup ? "그룹 채팅" : "1:1 채팅"}</p></div>
+        <div style={{ flex: 1 }}>
+          <p style={{ fontSize: 14, fontWeight: 700, color: "#fff", margin: 0 }}>{name}</p>
+          <p style={{ fontSize: 10, color: "#64748b", margin: 0 }}>{isGroup ? `그룹 채팅 · ${memberProfiles.length}명` : "1:1 채팅"}</p>
+        </div>
+        {currentRoom && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => setShowPanel(showPanel === "members" ? null : "members")} style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#94a3b8", fontSize: 11, fontWeight: 700, padding: "5px 8px", borderRadius: 8, cursor: "pointer", fontFamily: "Pretendard,sans-serif" }}>멤버</button>
+            <button onClick={() => setShowPanel(showPanel === "invite" ? null : "invite")} style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.2)", color: "#f59e0b", fontSize: 11, fontWeight: 700, padding: "5px 8px", borderRadius: 8, cursor: "pointer", fontFamily: "Pretendard,sans-serif" }}>초대</button>
+            <button onClick={() => { if(window.confirm("채팅방을 나가시겠습니까?")) { onLeaveRoom(roomId); onBack(); } }} style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)", color: "#f87171", fontSize: 11, fontWeight: 700, padding: "5px 8px", borderRadius: 8, cursor: "pointer", fontFamily: "Pretendard,sans-serif" }}>나가기</button>
+          </div>
+        )}
       </div>
+      {/* 멤버 패널 */}
+      {showPanel === "members" && (
+        <div style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid rgba(255,255,255,0.07)", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 8, maxHeight: 200, overflowY: "auto" }}>
+          <p style={{ fontSize: 11, fontWeight: 700, color: "#64748b", margin: 0 }}>참여 멤버 {memberProfiles.length}명</p>
+          {memberProfiles.map(p => (
+            <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Avatar profile={p} size={28} />
+              <div>
+                <p style={{ fontSize: 12, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>{p.name} {p.id === uid ? <span style={{ fontSize: 10, color: "#f59e0b" }}>(나)</span> : ""}</p>
+                <p style={{ fontSize: 10, color: "#64748b" }}>{p.org}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* 초대 패널 */}
+      {showPanel === "invite" && (
+        <div style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid rgba(255,255,255,0.07)", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 8, maxHeight: 240, overflowY: "auto" }}>
+          <p style={{ fontSize: 11, fontWeight: 700, color: "#64748b", margin: 0 }}>초대할 멤버 선택</p>
+          {nonMembers.length === 0 ? <p style={{ fontSize: 12, color: "#4b5563", fontStyle: "italic" }}>초대할 수 있는 멤버가 없어요.</p> :
+            nonMembers.map(p => {
+              const sel = invitees.includes(p.id);
+              return (
+                <div key={p.id} onClick={() => setInvitees(prev => sel ? prev.filter(id => id !== p.id) : [...prev, p.id])} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 10, background: sel ? "rgba(245,158,11,0.08)" : "none", cursor: "pointer" }}>
+                  <Avatar profile={p} size={28} />
+                  <p style={{ fontSize: 12, color: "#f1f5f9", margin: 0, flex: 1 }}>{p.name}</p>
+                  <div style={{ width: 16, height: 16, borderRadius: 5, border: `2px solid ${sel ? "#f59e0b" : "rgba(255,255,255,0.2)"}`, background: sel ? "#f59e0b" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#020617" }}>{sel ? "✓" : ""}</div>
+                </div>
+              );
+            })
+          }
+          {invitees.length > 0 && (
+            <button onClick={async () => { await onInviteToRoom(roomId, invitees); setInvitees([]); setShowPanel(null); }} style={{ ...S.btnAmber, padding: 10, fontSize: 12, borderRadius: 10 }}>
+              {invitees.length}명 초대하기
+            </button>
+          )}
+        </div>
+      )}
       <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
         {msgs.length === 0 && <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#4b5563", fontSize: 13, fontStyle: "italic" }}>첫 메시지를 보내보세요 👋</div>}
         {msgs.map((m, i) => {
@@ -950,15 +1089,18 @@ function Meetings({ meetings, profiles, uid, onUpdate, onChat }) {
   );
 }
 
-function Community({ posts, profiles, rooms, uid, onOpenPost, onNewPost, onOpenChat, onCreateRoom }) {
+function Community({ posts, profiles, rooms, uid, onOpenPost, onNewPost, onOpenChat, onCreateRoom, onLeaveRoom, onInviteToRoom }) {
   const [tab, setTab]           = useState("board");
   const [showCreate, setCreate] = useState(false);
-  const [newRoom, setNewRoom]   = useState({ name: "", isPrivate: false, invitees: [] });
+  const [newRoom, setNewRoom]   = useState({ name: "", invitees: [] });
+
+  // 내가 참여한 방만 필터링 (전체 채팅방 제외, rooms 중 members에 uid 포함)
+  const myRooms = rooms.filter(r => (r.members || []).includes(uid));
 
   const handleCreate = async () => {
     if (!newRoom.name.trim()) return alert("채팅방 이름을 입력해주세요.");
-    await onCreateRoom({ name: newRoom.name, isPrivate: newRoom.isPrivate, members: [uid, ...newRoom.invitees] });
-    setNewRoom({ name: "", isPrivate: false, invitees: [] }); setCreate(false);
+    await onCreateRoom({ name: newRoom.name, members: [uid, ...newRoom.invitees] });
+    setNewRoom({ name: "", invitees: [] }); setCreate(false);
   };
 
   return (
@@ -997,10 +1139,16 @@ function Community({ posts, profiles, rooms, uid, onOpenPost, onNewPost, onOpenC
               <div style={{ flex: 1 }}><p style={{ fontSize: 14, fontWeight: 700, color: "#f59e0b", margin: 0 }}>전체 채팅방</p><p style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>모든 참여자 {profiles.length}명</p></div>
               <span style={{ color: "#f59e0b", opacity: 0.5 }}>→</span>
             </button>
-            {rooms.map(room => (
+            {myRooms.length === 0 && (
+              <p style={{ fontSize: 12, color: "#64748b", fontStyle: "italic", textAlign: "center", padding: "20px 0" }}>참여 중인 채팅방이 없어요.<br/>새 채팅방을 만들어보세요!</p>
+            )}
+            {myRooms.map(room => (
               <button key={room.id} onClick={() => onOpenChat(room.id, room.name)} style={{ display: "flex", alignItems: "center", gap: 14, ...S.card, borderRadius: 18, cursor: "pointer", width: "100%", textAlign: "left" }}>
-                <div style={{ width: 44, height: 44, background: "rgba(255,255,255,0.05)", borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>{room.isPrivate ? "🔒" : "💬"}</div>
-                <div style={{ flex: 1 }}><p style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>{room.name}</p><p style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{room.isPrivate ? "비공개" : "공개"} · 멤버 {room.members?.length || 0}명</p></div>
+                <div style={{ width: 44, height: 44, background: "rgba(255,255,255,0.05)", borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>💬</div>
+                <div style={{ flex: 1 }}>
+                  <p style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>{room.name}</p>
+                  <p style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>멤버 {room.members?.length || 0}명</p>
+                </div>
                 <span style={{ color: "#64748b" }}>→</span>
               </button>
             ))}
@@ -1008,7 +1156,10 @@ function Community({ posts, profiles, rooms, uid, onOpenPost, onNewPost, onOpenC
               <button onClick={() => setCreate(true)} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: 14, border: "2px dashed rgba(255,255,255,0.12)", borderRadius: 18, background: "none", color: "#64748b", cursor: "pointer", fontFamily: "Pretendard,sans-serif", fontSize: 13, fontWeight: 700, width: "100%" }}>+ 채팅방 만들기</button>
             ) : (
               <div style={{ ...S.card, borderRadius: 18, display: "flex", flexDirection: "column", gap: 12, border: "1px solid rgba(245,158,11,0.25)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><p style={{ fontSize: 14, fontWeight: 700, color: "#fff", margin: 0 }}>새 채팅방</p><button onClick={() => setCreate(false)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 18 }}>✕</button></div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <p style={{ fontSize: 14, fontWeight: 700, color: "#fff", margin: 0 }}>새 채팅방</p>
+                  <button onClick={() => setCreate(false)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 18 }}>✕</button>
+                </div>
                 <div><label style={S.lbl}>채팅방 이름</label><input style={S.inp} placeholder="예: 어바인 육아 모임" value={newRoom.name} onChange={e => setNewRoom(r => ({ ...r, name: e.target.value }))} /></div>
                 <div>
                   <label style={S.lbl}>멤버 초대</label>
@@ -1016,17 +1167,12 @@ function Community({ posts, profiles, rooms, uid, onOpenPost, onNewPost, onOpenC
                     const sel = newRoom.invitees.includes(p.id);
                     return (
                       <div key={p.id} onClick={() => setNewRoom(r => ({ ...r, invitees: sel ? r.invitees.filter(id => id !== p.id) : [...r.invitees, p.id] }))} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 12, background: sel ? "rgba(245,158,11,0.08)" : "rgba(255,255,255,0.03)", border: `1px solid ${sel ? "rgba(245,158,11,0.25)" : "rgba(255,255,255,0.06)"}`, cursor: "pointer", marginBottom: 6 }}>
-                        <Avatar profile={p} size={30} /><p style={{ fontSize: 13, color: "#f1f5f9", margin: 0, flex: 1 }}>{p.name}</p>
+                        <Avatar profile={p} size={30} />
+                        <p style={{ fontSize: 13, color: "#f1f5f9", margin: 0, flex: 1 }}>{p.name}</p>
                         <div style={{ width: 18, height: 18, borderRadius: 6, border: `2px solid ${sel ? "#f59e0b" : "rgba(255,255,255,0.2)"}`, background: sel ? "#f59e0b" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#020617" }}>{sel ? "✓" : ""}</div>
                       </div>
                     );
                   })}
-                </div>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", background: "rgba(255,255,255,0.04)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.07)" }}>
-                  <div><p style={{ fontSize: 13, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>비공개 채팅방</p><p style={{ fontSize: 10, color: "#64748b", marginTop: 2 }}>초대된 멤버만 참여 가능</p></div>
-                  <div onClick={() => setNewRoom(r => ({ ...r, isPrivate: !r.isPrivate }))} style={{ width: 44, height: 24, borderRadius: 12, background: newRoom.isPrivate ? "#f59e0b" : "rgba(255,255,255,0.1)", position: "relative", cursor: "pointer", transition: "all 0.2s" }}>
-                    <div style={{ position: "absolute", top: 2, left: newRoom.isPrivate ? 22 : 2, width: 20, height: 20, borderRadius: 10, background: "#fff", transition: "all 0.2s" }} />
-                  </div>
                 </div>
                 <button onClick={handleCreate} style={{ ...S.btnAmber, width: "100%", padding: 12 }}>채팅방 개설하기</button>
               </div>

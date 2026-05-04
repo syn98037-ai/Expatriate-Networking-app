@@ -9,60 +9,62 @@ service cloud.firestore {
       return request.auth.uid == userId;
     }
 
-    // 프로필: 로그인하면 읽기, 본인만 쓰기 / 삭제는 누구나 허용(관리자 삭제용)
     match /profiles/{userId} {
-      allow read: if isLoggedIn();
+      allow read: if true;
       allow create, update: if isOwner(userId);
-      allow delete: if isLoggedIn(); // 관리자가 삭제할 수 있도록
+      allow delete: if isLoggedIn();
     }
 
-    // 관리자 오버라이드: 로그인한 사용자 모두 쓰기 가능 (관리자 수정용)
     match /adminOverrides/{userId} {
-      allow read, write: if isLoggedIn();
+      allow read, write: if true;
     }
 
-    // 티미팅: 로그인하면 읽기/쓰기
     match /meetings/{meetingId} {
-      allow read, write: if isLoggedIn();
+      allow read: if true;
+      allow write: if isLoggedIn();
     }
 
-    // 게시글
     match /posts/{postId} {
-      allow read: if isLoggedIn();
+      allow read: if true;
       allow create: if isLoggedIn();
       allow update: if isLoggedIn();
-      allow delete: if isLoggedIn() && request.auth.uid == resource.data.authorId;
+      allow delete: if isLoggedIn() &&
+        request.auth.uid == resource.data.authorId;
       match /comments/{commentId} {
-        allow read: if isLoggedIn();
+        allow read: if true;
         allow create: if isLoggedIn();
-        allow delete: if isLoggedIn() && request.auth.uid == resource.data.authorId;
+        allow delete: if isLoggedIn() &&
+          request.auth.uid == resource.data.authorId;
       }
     }
 
-    // 채팅
     match /chats/{roomId}/messages/{msgId} {
-      allow read, create: if isLoggedIn();
+      allow read: if true;
+      allow create: if isLoggedIn();
     }
 
-    // 채팅방 목록
     match /rooms/{roomId} {
-      allow read: if isLoggedIn();
+      allow read: if true;
       allow create: if isLoggedIn();
-      allow update, delete: if isLoggedIn() && request.auth.uid == resource.data.creatorId;
+      allow update: if isLoggedIn();
+      allow delete: if isLoggedIn();
     }
 
-    // 일정
     match /events/{eventId} {
-      allow read: if isLoggedIn();
+      allow read: if true;
       allow create: if isLoggedIn();
-      allow update, delete: if isLoggedIn() && request.auth.uid == resource.data.creatorId;
+      allow update, delete: if isLoggedIn() &&
+        request.auth.uid == resource.data.creatorId;
     }
 
-    // 미션: 본인만 읽기/쓰기, 관리자도 읽기 가능
     match /missions/{userId} {
-      allow read: if isLoggedIn();
+      allow read: if true;
       allow write: if isOwner(userId);
-      allow delete: if isLoggedIn(); // 관리자 삭제용
+      allow delete: if isLoggedIn();
+    }
+
+    match /deletedAccounts/{username} {
+      allow read, write: if true;
     }
   }
 }
